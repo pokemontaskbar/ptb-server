@@ -1,0 +1,16 @@
+{
+  "name": "ptb-server",
+  "version": "0.1.0",
+  "description": "Pokemon Task Bar - servidor minimo (Fase 1, passo 2): conta + save no servidor",
+  "type": "module",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node --watch src/server.js"
+  },
+  "dependencies": {
+    "fastify": "^5.2.0",
+    "@fastify/cors": "^10.0.1",
+    "pg": "^8.13.1"
+  }
+}
