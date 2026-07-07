@@ -1,18 +1,18 @@
 // ============================================================================
-// PTB SERVER - Servidor minimo (Fase 1, passo 2 do PLANO_BACKEND_TOKEN.md)
+// PTB SERVER - Minimal server (Phase 1, step 2 of PLANO_BACKEND_TOKEN.md)
 // ----------------------------------------------------------------------------
-// O QUE ESTE SERVIDOR FAZ (e SO isto - de proposito, sem scope creep):
-//   1. Cria conta de jogador (email + senha).
-//   2. Login (devolve um "cracha" temporario = token de sessao).
-//   3. Salva o save do jogo no servidor (por jogador).
-//   4. Carrega o save do jogo do servidor.
+// WHAT THIS SERVER DOES (and ONLY this - on purpose, no scope creep):
+//   1. Creates a player account (email + password).
+//   2. Login (returns a temporary "badge" = session token).
+//   3. Saves the game save on the server (per player).
+//   4. Loads the game save from the server.
 //
-// O QUE ELE AINDA NAO FAZ (vem nos proximos passos do plano):
-//   - Recalcular economia (o "juiz") ....... passo 3 da Fase 1
-//   - Anti-trapaca ......................... passo 4 da Fase 1
-//   - Token / deposito / saque ............. Fases 3 e 4
+// WHAT IT DOES NOT DO YET (comes in the next steps of the plan):
+//   - Recompute economy (the "judge") ...... step 3 of Phase 1
+//   - Anti-cheat ........................... step 4 of Phase 1
+//   - Token / deposit / withdrawal ......... Phases 3 and 4
 //
-// Este passo so prova que da pra TIRAR o save do navegador e guardar no servidor.
+// This step only proves we can MOVE the save out of the browser and store it on the server.
 // ============================================================================
 
 import Fastify from 'fastify';
@@ -22,42 +22,42 @@ import crypto from 'node:crypto';
 
 const { Pool } = pg;
 
-// ---- Conexao com o banco de dados Postgres ---------------------------------
-// A URL do banco vem de uma "variavel de ambiente" (o Railway fornece isso
-// automaticamente quando voce adiciona um Postgres ao projeto - 1 clique).
+// ---- Connection to the Postgres database -----------------------------------
+// The database URL comes from an "environment variable" (Railway provides it
+// automatically when you add a Postgres to the project - 1 click).
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
-  // Railway/Render usam SSL; local nao. Detecta automatico.
+  // Railway/Render use SSL; local does not. Auto-detects.
   ssl: process.env.DATABASE_URL?.includes('localhost') ? false : { rejectUnauthorized: false }
 });
 
-// ---- Criar as tabelas do banco na primeira vez que o servidor sobe ----------
+// ---- Create the database tables the first time the server starts up ---------
 async function initDb() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS players (
       id           BIGSERIAL PRIMARY KEY,
       email        TEXT UNIQUE NOT NULL,
-      pass_hash    TEXT NOT NULL,        -- senha NUNCA guardada em texto puro
-      pass_salt    TEXT NOT NULL,        -- "tempero" unico por jogador
+      pass_hash    TEXT NOT NULL,        -- password NEVER stored in plain text
+      pass_salt    TEXT NOT NULL,        -- unique "salt" per player
       created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
     );
     CREATE TABLE IF NOT EXISTS saves (
       player_id    BIGINT PRIMARY KEY REFERENCES players(id) ON DELETE CASCADE,
-      save_json    JSONB NOT NULL,       -- o save do jogo, do jeitinho que o jogo manda
+      save_json    JSONB NOT NULL,       -- the game save, exactly as the game sends it
       version      TEXT,
       updated_at   TIMESTAMPTZ NOT NULL DEFAULT now()
     );
     CREATE TABLE IF NOT EXISTS sessions (
-      token        TEXT PRIMARY KEY,     -- o "cracha" temporario do login
+      token        TEXT PRIMARY KEY,     -- the temporary login "badge"
       player_id    BIGINT NOT NULL REFERENCES players(id) ON DELETE CASCADE,
       created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
     );
   `);
 }
 
-// ---- Seguranca de senha: hash com salt (padrao, sem guardar senha pura) -----
+// ---- Password security: hash with salt (standard, never store plain password) -----
 function hashPassword(password, salt) {
-  // scrypt: algoritmo lento de proposito, dificulta ataque de forca bruta.
+  // scrypt: deliberately slow algorithm, hardens against brute-force attacks.
   return crypto.scryptSync(password, salt, 64).toString('hex');
 }
 function newSalt() {
@@ -67,15 +67,15 @@ function newSessionToken() {
   return crypto.randomBytes(32).toString('hex');
 }
 
-// ---- Servidor web ----------------------------------------------------------
+// ---- Web server ------------------------------------------------------------
 const app = Fastify({ logger: true });
-await app.register(cors, { origin: true }); // permite o jogo (no navegador) falar com o servidor
+await app.register(cors, { origin: true }); // lets the game (in the browser) talk to the server
 
-// Saude do servidor (pra saber se esta de pe)
+// Server health (to know if it's up)
 app.get('/health', async () => ({ ok: true, ts: Date.now() }));
 
-// ---- CRIAR CONTA -----------------------------------------------------------
-// O jogo manda { email, password }. O servidor cria o jogador.
+// ---- CREATE ACCOUNT --------------------------------------------------------
+// The game sends { email, password }. The server creates the player.
 app.post('/register', async (req, reply) => {
   const { email, password } = req.body || {};
   if (!email || !password) return reply.code(400).send({ error: 'Email and password are required' });
@@ -97,7 +97,7 @@ app.post('/register', async (req, reply) => {
 });
 
 // ---- LOGIN -----------------------------------------------------------------
-// O jogo manda { email, password }. Se bater, devolve um "cracha" (token).
+// The game sends { email, password }. If it matches, returns a "badge" (token).
 app.post('/login', async (req, reply) => {
   const { email, password } = req.body || {};
   if (!email || !password) return reply.code(400).send({ error: 'Email and password are required' });
@@ -118,7 +118,7 @@ app.post('/login', async (req, reply) => {
   return { ok: true, token, playerId: p.id };
 });
 
-// ---- Middleware: descobrir QUEM esta pedindo (pelo cracha) ------------------
+// ---- Middleware: figure out WHO is requesting (by the badge) ---------------
 async function requirePlayer(req, reply) {
   const auth = req.headers['authorization'] || '';
   const token = auth.startsWith('Bearer ') ? auth.slice(7) : null;
@@ -128,11 +128,11 @@ async function requirePlayer(req, reply) {
   return r.rows[0].player_id;
 }
 
-// ---- SALVAR O SAVE ---------------------------------------------------------
-// O jogo manda o save inteiro (o mesmo objeto que hoje vai pro localStorage).
-// NOTA: neste passo o servidor CONFIA no save (so guarda). O "juiz" que
-// valida os numeros vem no passo 3 - ainda nao e seguro contra trapaca, e
-// esta certo assim: este passo so prova a fundacao (tirar o save do navegador).
+// ---- SAVE THE SAVE ---------------------------------------------------------
+// The game sends the whole save (the same object that today goes to localStorage).
+// NOTE: at this step the server TRUSTS the save (just stores it). The "judge" that
+// validates the numbers comes in step 3 - not yet cheat-proof, and
+// that's fine: this step only proves the foundation (move the save out of the browser).
 app.post('/save', async (req, reply) => {
   const playerId = await requirePlayer(req, reply);
   if (!playerId) return;
@@ -148,16 +148,16 @@ app.post('/save', async (req, reply) => {
   return { ok: true, savedAt: Date.now() };
 });
 
-// ---- CARREGAR O SAVE -------------------------------------------------------
+// ---- LOAD THE SAVE ---------------------------------------------------------
 app.get('/save', async (req, reply) => {
   const playerId = await requirePlayer(req, reply);
   if (!playerId) return;
   const r = await pool.query('SELECT save_json, updated_at FROM saves WHERE player_id=$1', [playerId]);
-  if (r.rowCount === 0) return { ok: true, save: null }; // jogador novo, sem save ainda
+  if (r.rowCount === 0) return { ok: true, save: null }; // new player, no save yet
   return { ok: true, save: r.rows[0].save_json, updatedAt: r.rows[0].updated_at };
 });
 
-// ---- Ligar o servidor ------------------------------------------------------
+// ---- Start the server ------------------------------------------------------
 const PORT = process.env.PORT || 3000;
 try {
   await initDb();
