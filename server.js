@@ -53,6 +53,11 @@ async function initDb() {
       created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
     );
   `);
+  // ---- Ranking migrations (idempotent) ----
+  await pool.query(`ALTER TABLE players ADD COLUMN IF NOT EXISTS nickname TEXT`);
+  await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS players_nickname_uq ON players (LOWER(nickname)) WHERE nickname IS NOT NULL`);
+  await pool.query(`ALTER TABLE saves ADD COLUMN IF NOT EXISTS score INTEGER NOT NULL DEFAULT 0`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS saves_score_idx ON saves (score DESC)`);
 }
 
 // ---- Password security: hash with salt (standard, never store plain password) -----
@@ -65,6 +70,44 @@ function newSalt() {
 }
 function newSessionToken() {
   return crypto.randomBytes(32).toString('hex');
+}
+
+// ---- SERVER-SIDE SCORE (mini-judge for the ranking) -------------------------
+// The client's `score` field is NEVER trusted. The server recomputes the score
+// from the finite, verifiable sets in the save (species/stages/acts), using the
+// exact same formulas as the game. This kills the trivial `G.score=999999`
+// cheat and enforces a hard mathematical ceiling.
+const POKE_BST = [0,318,405,525,309,405,534,314,405,530,195,205,395,195,205,395,251,349,479,253,413,262,442,288,448,320,485,300,450,275,365,505,273,365,505,323,483,299,505,270,435,245,455,320,395,490,285,405,305,450,265,425,290,440,320,500,305,455,350,555,300,385,510,310,400,500,305,405,505,300,390,490,335,515,300,390,495,410,500,315,490,325,465,377,310,470,325,475,325,500,305,525,310,405,500,385,328,483,325,475,330,490,325,530,320,425,455,455,385,340,490,345,485,450,435,490,295,440,320,450,340,520,460,500,455,490,495,500,490,200,540,535,288,325,525,525,525,395,355,495,355,495,515,540,580,580,580,300,420,600,680,600];
+const RARITY_STR = '1231231231111111131212121312113113131312121131212121213121411312312311313113131312113131313123113131313122211313223121213232333314311333113133455512455';
+function rarityOf(id){ const c = RARITY_STR.charCodeAt(id-1)-48; return (c>=1&&c<=5)?c:1; }
+function speciesPoints(sp){
+  const bst = POKE_BST[sp] || 200;
+  const rarMul = 1 + (rarityOf(sp)-1)*0.5;
+  return Math.max(1, Math.round((bst/20) * rarMul));
+}
+function stagePoints(gs){ return gs * 10; }
+function actPoints(ai){ return (ai + 1) * 500; }
+
+// Validates the sets and recomputes the score. Garbage in -> ignored.
+function computeScore(save){
+  if(!save || typeof save !== 'object') return 0;
+  let total = 0;
+  const species = Array.isArray(save.scoredSpecies) ? save.scoredSpecies : [];
+  const stages  = Array.isArray(save.scoredStages)  ? save.scoredStages  : [];
+  const acts    = Array.isArray(save.scoredActs)    ? save.scoredActs    : [];
+  // species: unique ints 1..151
+  const sp = new Set();
+  for(const v of species){ if(Number.isInteger(v) && v>=1 && v<=151) sp.add(v); }
+  for(const v of sp) total += speciesPoints(v);
+  // stages: unique ints 1..120 (game documents st1..st120)
+  const st = new Set();
+  for(const v of stages){ if(Number.isInteger(v) && v>=1 && v<=120) st.add(v); }
+  for(const v of st) total += stagePoints(v);
+  // acts: unique ints 0..11 (12 global acts, 500..6000)
+  const ac = new Set();
+  for(const v of acts){ if(Number.isInteger(v) && v>=0 && v<=11) ac.add(v); }
+  for(const v of ac) total += actPoints(v);
+  return total;
 }
 
 // ---- Web server ------------------------------------------------------------
@@ -139,11 +182,14 @@ app.post('/save', async (req, reply) => {
   const save = req.body;
   if (!save || typeof save !== 'object') return reply.code(400).send({ error: 'Invalid save data' });
 
+  // Server-side score: recomputed from the sets, never trusted from the client.
+  const score = computeScore(save);
+
   await pool.query(
-    `INSERT INTO saves (player_id, save_json, version, updated_at)
-     VALUES ($1,$2,$3, now())
-     ON CONFLICT (player_id) DO UPDATE SET save_json=$2, version=$3, updated_at=now()`,
-    [playerId, save, save.v || null]
+    `INSERT INTO saves (player_id, save_json, version, score, updated_at)
+     VALUES ($1,$2,$3,$4, now())
+     ON CONFLICT (player_id) DO UPDATE SET save_json=$2, version=$3, score=$4, updated_at=now()`,
+    [playerId, save, save.v || null, score]
   );
   return { ok: true, savedAt: Date.now() };
 });
@@ -155,6 +201,76 @@ app.get('/save', async (req, reply) => {
   const r = await pool.query('SELECT save_json, updated_at FROM saves WHERE player_id=$1', [playerId]);
   if (r.rowCount === 0) return { ok: true, save: null }; // new player, no save yet
   return { ok: true, save: r.rows[0].save_json, updatedAt: r.rows[0].updated_at };
+});
+
+// ---- SET NICKNAME -----------------------------------------------------------
+// The public name shown on the leaderboard. 3-16 chars, letters/numbers/underscore.
+// Unique (case-insensitive) - same race-safe pattern as email (UNIQUE index + catch).
+const _nickRate = new Map(); // playerId -> last change ts (light in-memory rate limit)
+app.post('/nickname', async (req, reply) => {
+  const playerId = await requirePlayer(req, reply);
+  if (!playerId) return;
+  const nick = String(req.body?.nickname || '').trim();
+  if (!/^[A-Za-z0-9_]{3,16}$/.test(nick)) {
+    return reply.code(400).send({ error: 'Nickname must be 3-16 chars: letters, numbers, underscore' });
+  }
+  const last = _nickRate.get(playerId) || 0;
+  if (Date.now() - last < 60_000) {
+    return reply.code(429).send({ error: 'Please wait a minute before changing nickname again' });
+  }
+  try {
+    await pool.query('UPDATE players SET nickname=$1 WHERE id=$2', [nick, playerId]);
+    _nickRate.set(playerId, Date.now());
+    return { ok: true, nickname: nick };
+  } catch (e) {
+    if (e.code === '23505') return reply.code(409).send({ error: 'Nickname already taken' });
+    throw e;
+  }
+});
+
+// ---- LEADERBOARD ------------------------------------------------------------
+// Top 20 by server-computed score + the requester's own position (if logged in).
+// Only players who set a nickname appear. Cached 10s to protect the database.
+let _lbCache = null, _lbCacheTs = 0;
+app.get('/leaderboard', async (req, reply) => {
+  const now = Date.now();
+  if (!_lbCache || now - _lbCacheTs > 10_000) {
+    const top = await pool.query(
+      `SELECT p.nickname, s.score
+         FROM saves s JOIN players p ON p.id = s.player_id
+        WHERE p.nickname IS NOT NULL
+        ORDER BY s.score DESC, s.updated_at ASC
+        LIMIT 20`
+    );
+    const tot = await pool.query(
+      `SELECT COUNT(*)::int AS n FROM saves s JOIN players p ON p.id = s.player_id WHERE p.nickname IS NOT NULL`
+    );
+    _lbCache = { top: top.rows.map((r, i) => ({ rank: i + 1, nickname: r.nickname, score: r.score })), total: tot.rows[0].n };
+    _lbCacheTs = now;
+  }
+  const out = { ok: true, top: _lbCache.top, total: _lbCache.total };
+
+  // "me": optional - resolved per request (not cached), via Bearer token
+  const auth = req.headers.authorization || '';
+  const token = auth.startsWith('Bearer ') ? auth.slice(7) : null;
+  if (token) {
+    const sess = await pool.query('SELECT player_id FROM sessions WHERE token=$1', [token]);
+    if (sess.rowCount > 0) {
+      const pid = sess.rows[0].player_id;
+      const me = await pool.query(
+        `SELECT p.nickname, s.score,
+                (SELECT COUNT(*)::int + 1 FROM saves s2 JOIN players p2 ON p2.id=s2.player_id
+                  WHERE p2.nickname IS NOT NULL AND s2.score > s.score) AS rank
+           FROM players p LEFT JOIN saves s ON s.player_id = p.id
+          WHERE p.id = $1`, [pid]
+      );
+      if (me.rowCount > 0) {
+        out.me = { nickname: me.rows[0].nickname, score: me.rows[0].score || 0,
+                   rank: me.rows[0].nickname ? me.rows[0].rank : null };
+      }
+    }
+  }
+  return out;
 });
 
 // ---- Start the server ------------------------------------------------------
