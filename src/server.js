@@ -1,18 +1,18 @@
 // ============================================================================
-// PTB SERVER - Servidor minimo (Fase 1, passo 2 do PLANO_BACKEND_TOKEN.md)
+// PTB SERVER - Minimal server (Phase 1, step 2 of PLANO_BACKEND_TOKEN.md)
 // ----------------------------------------------------------------------------
-// O QUE ESTE SERVIDOR FAZ (e SO isto - de proposito, sem scope creep):
-//   1. Cria conta de jogador (email + senha).
-//   2. Login (devolve um "cracha" temporario = token de sessao).
-//   3. Salva o save do jogo no servidor (por jogador).
-//   4. Carrega o save do jogo do servidor.
+// WHAT THIS SERVER DOES (and ONLY this - on purpose, no scope creep):
+//   1. Creates a player account (email + password).
+//   2. Login (returns a temporary "badge" = session token).
+//   3. Saves the game save on the server (per player).
+//   4. Loads the game save from the server.
 //
-// O QUE ELE AINDA NAO FAZ (vem nos proximos passos do plano):
-//   - Recalcular economia (o "juiz") ....... passo 3 da Fase 1
-//   - Anti-trapaca ......................... passo 4 da Fase 1
-//   - Token / deposito / saque ............. Fases 3 e 4
+// WHAT IT DOES NOT DO YET (comes in the next steps of the plan):
+//   - Recompute economy (the "judge") ...... step 3 of Phase 1
+//   - Anti-cheat ........................... step 4 of Phase 1
+//   - Token / deposit / withdrawal ......... Phases 3 and 4
 //
-// Este passo so prova que da pra TIRAR o save do navegador e guardar no servidor.
+// This step only proves we can MOVE the save out of the browser and store it on the server.
 // ============================================================================
 
 import Fastify from 'fastify';
@@ -22,42 +22,47 @@ import crypto from 'node:crypto';
 
 const { Pool } = pg;
 
-// ---- Conexao com o banco de dados Postgres ---------------------------------
-// A URL do banco vem de uma "variavel de ambiente" (o Railway fornece isso
-// automaticamente quando voce adiciona um Postgres ao projeto - 1 clique).
+// ---- Connection to the Postgres database -----------------------------------
+// The database URL comes from an "environment variable" (Railway provides it
+// automatically when you add a Postgres to the project - 1 click).
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
-  // Railway/Render usam SSL; local nao. Detecta automatico.
+  // Railway/Render use SSL; local does not. Auto-detects.
   ssl: process.env.DATABASE_URL?.includes('localhost') ? false : { rejectUnauthorized: false }
 });
 
-// ---- Criar as tabelas do banco na primeira vez que o servidor sobe ----------
+// ---- Create the database tables the first time the server starts up ---------
 async function initDb() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS players (
       id           BIGSERIAL PRIMARY KEY,
       email        TEXT UNIQUE NOT NULL,
-      pass_hash    TEXT NOT NULL,        -- senha NUNCA guardada em texto puro
-      pass_salt    TEXT NOT NULL,        -- "tempero" unico por jogador
+      pass_hash    TEXT NOT NULL,        -- password NEVER stored in plain text
+      pass_salt    TEXT NOT NULL,        -- unique "salt" per player
       created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
     );
     CREATE TABLE IF NOT EXISTS saves (
       player_id    BIGINT PRIMARY KEY REFERENCES players(id) ON DELETE CASCADE,
-      save_json    JSONB NOT NULL,       -- o save do jogo, do jeitinho que o jogo manda
+      save_json    JSONB NOT NULL,       -- the game save, exactly as the game sends it
       version      TEXT,
       updated_at   TIMESTAMPTZ NOT NULL DEFAULT now()
     );
     CREATE TABLE IF NOT EXISTS sessions (
-      token        TEXT PRIMARY KEY,     -- o "cracha" temporario do login
+      token        TEXT PRIMARY KEY,     -- the temporary login "badge"
       player_id    BIGINT NOT NULL REFERENCES players(id) ON DELETE CASCADE,
       created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
     );
   `);
+  // ---- Ranking migrations (idempotent) ----
+  await pool.query(`ALTER TABLE players ADD COLUMN IF NOT EXISTS nickname TEXT`);
+  await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS players_nickname_uq ON players (LOWER(nickname)) WHERE nickname IS NOT NULL`);
+  await pool.query(`ALTER TABLE saves ADD COLUMN IF NOT EXISTS score INTEGER NOT NULL DEFAULT 0`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS saves_score_idx ON saves (score DESC)`);
 }
 
-// ---- Seguranca de senha: hash com salt (padrao, sem guardar senha pura) -----
+// ---- Password security: hash with salt (standard, never store plain password) -----
 function hashPassword(password, salt) {
-  // scrypt: algoritmo lento de proposito, dificulta ataque de forca bruta.
+  // scrypt: deliberately slow algorithm, hardens against brute-force attacks.
   return crypto.scryptSync(password, salt, 64).toString('hex');
 }
 function newSalt() {
@@ -67,19 +72,57 @@ function newSessionToken() {
   return crypto.randomBytes(32).toString('hex');
 }
 
-// ---- Servidor web ----------------------------------------------------------
-const app = Fastify({ logger: true });
-await app.register(cors, { origin: true }); // permite o jogo (no navegador) falar com o servidor
+// ---- SERVER-SIDE SCORE (mini-judge for the ranking) -------------------------
+// The client's `score` field is NEVER trusted. The server recomputes the score
+// from the finite, verifiable sets in the save (species/stages/acts), using the
+// exact same formulas as the game. This kills the trivial `G.score=999999`
+// cheat and enforces a hard mathematical ceiling.
+const POKE_BST = [0,318,405,525,309,405,534,314,405,530,195,205,395,195,205,395,251,349,479,253,413,262,442,288,448,320,485,300,450,275,365,505,273,365,505,323,483,299,505,270,435,245,455,320,395,490,285,405,305,450,265,425,290,440,320,500,305,455,350,555,300,385,510,310,400,500,305,405,505,300,390,490,335,515,300,390,495,410,500,315,490,325,465,377,310,470,325,475,325,500,305,525,310,405,500,385,328,483,325,475,330,490,325,530,320,425,455,455,385,340,490,345,485,450,435,490,295,440,320,450,340,520,460,500,455,490,495,500,490,200,540,535,288,325,525,525,525,395,355,495,355,495,515,540,580,580,580,300,420,600,680,600];
+const RARITY_STR = '1231231231111111131212121312113113131312121131212121213121411312312311313113131312113131313123113131313122211313223121213232333314311333113133455512455';
+function rarityOf(id){ const c = RARITY_STR.charCodeAt(id-1)-48; return (c>=1&&c<=5)?c:1; }
+function speciesPoints(sp){
+  const bst = POKE_BST[sp] || 200;
+  const rarMul = 1 + (rarityOf(sp)-1)*0.5;
+  return Math.max(1, Math.round((bst/20) * rarMul));
+}
+function stagePoints(gs){ return gs * 10; }
+function actPoints(ai){ return (ai + 1) * 500; }
 
-// Saude do servidor (pra saber se esta de pe)
+// Validates the sets and recomputes the score. Garbage in -> ignored.
+function computeScore(save){
+  if(!save || typeof save !== 'object') return 0;
+  let total = 0;
+  const species = Array.isArray(save.scoredSpecies) ? save.scoredSpecies : [];
+  const stages  = Array.isArray(save.scoredStages)  ? save.scoredStages  : [];
+  const acts    = Array.isArray(save.scoredActs)    ? save.scoredActs    : [];
+  // species: unique ints 1..151
+  const sp = new Set();
+  for(const v of species){ if(Number.isInteger(v) && v>=1 && v<=151) sp.add(v); }
+  for(const v of sp) total += speciesPoints(v);
+  // stages: unique ints 1..120 (game documents st1..st120)
+  const st = new Set();
+  for(const v of stages){ if(Number.isInteger(v) && v>=1 && v<=120) st.add(v); }
+  for(const v of st) total += stagePoints(v);
+  // acts: unique ints 0..11 (12 global acts, 500..6000)
+  const ac = new Set();
+  for(const v of acts){ if(Number.isInteger(v) && v>=0 && v<=11) ac.add(v); }
+  for(const v of ac) total += actPoints(v);
+  return total;
+}
+
+// ---- Web server ------------------------------------------------------------
+const app = Fastify({ logger: true });
+await app.register(cors, { origin: true }); // lets the game (in the browser) talk to the server
+
+// Server health (to know if it's up)
 app.get('/health', async () => ({ ok: true, ts: Date.now() }));
 
-// ---- CRIAR CONTA -----------------------------------------------------------
-// O jogo manda { email, password }. O servidor cria o jogador.
+// ---- CREATE ACCOUNT --------------------------------------------------------
+// The game sends { email, password }. The server creates the player.
 app.post('/register', async (req, reply) => {
   const { email, password } = req.body || {};
-  if (!email || !password) return reply.code(400).send({ error: 'email e senha obrigatorios' });
-  if (String(password).length < 6) return reply.code(400).send({ error: 'senha muito curta (min 6)' });
+  if (!email || !password) return reply.code(400).send({ error: 'Email and password are required' });
+  if (String(password).length < 6) return reply.code(400).send({ error: 'Password too short (min 6)' });
 
   const salt = newSalt();
   const hash = hashPassword(password, salt);
@@ -90,74 +133,147 @@ app.post('/register', async (req, reply) => {
     );
     return { ok: true, playerId: r.rows[0].id };
   } catch (e) {
-    if (e.code === '23505') return reply.code(409).send({ error: 'email ja cadastrado' });
+    if (e.code === '23505') return reply.code(409).send({ error: 'Email already registered' });
     req.log.error(e);
-    return reply.code(500).send({ error: 'erro ao criar conta' });
+    return reply.code(500).send({ error: 'Failed to create account' });
   }
 });
 
 // ---- LOGIN -----------------------------------------------------------------
-// O jogo manda { email, password }. Se bater, devolve um "cracha" (token).
+// The game sends { email, password }. If it matches, returns a "badge" (token).
 app.post('/login', async (req, reply) => {
   const { email, password } = req.body || {};
-  if (!email || !password) return reply.code(400).send({ error: 'email e senha obrigatorios' });
+  if (!email || !password) return reply.code(400).send({ error: 'Email and password are required' });
 
   const r = await pool.query('SELECT id, pass_hash, pass_salt FROM players WHERE email=$1',
     [String(email).toLowerCase().trim()]);
-  if (r.rowCount === 0) return reply.code(401).send({ error: 'email ou senha invalidos' });
+  if (r.rowCount === 0) return reply.code(401).send({ error: 'Invalid email or password' });
 
   const p = r.rows[0];
   const hash = hashPassword(password, p.pass_salt);
   // Comparacao segura (evita "timing attack")
   const ok = hash.length === p.pass_hash.length &&
              crypto.timingSafeEqual(Buffer.from(hash), Buffer.from(p.pass_hash));
-  if (!ok) return reply.code(401).send({ error: 'email ou senha invalidos' });
+  if (!ok) return reply.code(401).send({ error: 'Invalid email or password' });
 
   const token = newSessionToken();
   await pool.query('INSERT INTO sessions (token, player_id) VALUES ($1,$2)', [token, p.id]);
   return { ok: true, token, playerId: p.id };
 });
 
-// ---- Middleware: descobrir QUEM esta pedindo (pelo cracha) ------------------
+// ---- Middleware: figure out WHO is requesting (by the badge) ---------------
 async function requirePlayer(req, reply) {
   const auth = req.headers['authorization'] || '';
   const token = auth.startsWith('Bearer ') ? auth.slice(7) : null;
-  if (!token) { reply.code(401).send({ error: 'sem cracha (faca login)' }); return null; }
+  if (!token) { reply.code(401).send({ error: 'Not authenticated (please log in)' }); return null; }
   const r = await pool.query('SELECT player_id FROM sessions WHERE token=$1', [token]);
-  if (r.rowCount === 0) { reply.code(401).send({ error: 'cracha invalido (faca login)' }); return null; }
+  if (r.rowCount === 0) { reply.code(401).send({ error: 'Invalid session (please log in)' }); return null; }
   return r.rows[0].player_id;
 }
 
-// ---- SALVAR O SAVE ---------------------------------------------------------
-// O jogo manda o save inteiro (o mesmo objeto que hoje vai pro localStorage).
-// NOTA: neste passo o servidor CONFIA no save (so guarda). O "juiz" que
-// valida os numeros vem no passo 3 - ainda nao e seguro contra trapaca, e
-// esta certo assim: este passo so prova a fundacao (tirar o save do navegador).
+// ---- SAVE THE SAVE ---------------------------------------------------------
+// The game sends the whole save (the same object that today goes to localStorage).
+// NOTE: at this step the server TRUSTS the save (just stores it). The "judge" that
+// validates the numbers comes in step 3 - not yet cheat-proof, and
+// that's fine: this step only proves the foundation (move the save out of the browser).
 app.post('/save', async (req, reply) => {
   const playerId = await requirePlayer(req, reply);
   if (!playerId) return;
   const save = req.body;
-  if (!save || typeof save !== 'object') return reply.code(400).send({ error: 'save invalido' });
+  if (!save || typeof save !== 'object') return reply.code(400).send({ error: 'Invalid save data' });
+
+  // Server-side score: recomputed from the sets, never trusted from the client.
+  const score = computeScore(save);
 
   await pool.query(
-    `INSERT INTO saves (player_id, save_json, version, updated_at)
-     VALUES ($1,$2,$3, now())
-     ON CONFLICT (player_id) DO UPDATE SET save_json=$2, version=$3, updated_at=now()`,
-    [playerId, save, save.v || null]
+    `INSERT INTO saves (player_id, save_json, version, score, updated_at)
+     VALUES ($1,$2,$3,$4, now())
+     ON CONFLICT (player_id) DO UPDATE SET save_json=$2, version=$3, score=$4, updated_at=now()`,
+    [playerId, save, save.v || null, score]
   );
   return { ok: true, savedAt: Date.now() };
 });
 
-// ---- CARREGAR O SAVE -------------------------------------------------------
+// ---- LOAD THE SAVE ---------------------------------------------------------
 app.get('/save', async (req, reply) => {
   const playerId = await requirePlayer(req, reply);
   if (!playerId) return;
   const r = await pool.query('SELECT save_json, updated_at FROM saves WHERE player_id=$1', [playerId]);
-  if (r.rowCount === 0) return { ok: true, save: null }; // jogador novo, sem save ainda
+  if (r.rowCount === 0) return { ok: true, save: null }; // new player, no save yet
   return { ok: true, save: r.rows[0].save_json, updatedAt: r.rows[0].updated_at };
 });
 
-// ---- Ligar o servidor ------------------------------------------------------
+// ---- SET NICKNAME -----------------------------------------------------------
+// The public name shown on the leaderboard. 3-16 chars, letters/numbers/underscore.
+// Unique (case-insensitive) - same race-safe pattern as email (UNIQUE index + catch).
+const _nickRate = new Map(); // playerId -> last change ts (light in-memory rate limit)
+app.post('/nickname', async (req, reply) => {
+  const playerId = await requirePlayer(req, reply);
+  if (!playerId) return;
+  const nick = String(req.body?.nickname || '').trim();
+  if (!/^[A-Za-z0-9_]{3,16}$/.test(nick)) {
+    return reply.code(400).send({ error: 'Nickname must be 3-16 chars: letters, numbers, underscore' });
+  }
+  const last = _nickRate.get(playerId) || 0;
+  if (Date.now() - last < 60_000) {
+    return reply.code(429).send({ error: 'Please wait a minute before changing nickname again' });
+  }
+  try {
+    await pool.query('UPDATE players SET nickname=$1 WHERE id=$2', [nick, playerId]);
+    _nickRate.set(playerId, Date.now());
+    return { ok: true, nickname: nick };
+  } catch (e) {
+    if (e.code === '23505') return reply.code(409).send({ error: 'Nickname already taken' });
+    throw e;
+  }
+});
+
+// ---- LEADERBOARD ------------------------------------------------------------
+// Top 20 by server-computed score + the requester's own position (if logged in).
+// Only players who set a nickname appear. Cached 10s to protect the database.
+let _lbCache = null, _lbCacheTs = 0;
+app.get('/leaderboard', async (req, reply) => {
+  const now = Date.now();
+  if (!_lbCache || now - _lbCacheTs > 10_000) {
+    const top = await pool.query(
+      `SELECT p.nickname, s.score
+         FROM saves s JOIN players p ON p.id = s.player_id
+        WHERE p.nickname IS NOT NULL
+        ORDER BY s.score DESC, s.updated_at ASC
+        LIMIT 20`
+    );
+    const tot = await pool.query(
+      `SELECT COUNT(*)::int AS n FROM saves s JOIN players p ON p.id = s.player_id WHERE p.nickname IS NOT NULL`
+    );
+    _lbCache = { top: top.rows.map((r, i) => ({ rank: i + 1, nickname: r.nickname, score: r.score })), total: tot.rows[0].n };
+    _lbCacheTs = now;
+  }
+  const out = { ok: true, top: _lbCache.top, total: _lbCache.total };
+
+  // "me": optional - resolved per request (not cached), via Bearer token
+  const auth = req.headers.authorization || '';
+  const token = auth.startsWith('Bearer ') ? auth.slice(7) : null;
+  if (token) {
+    const sess = await pool.query('SELECT player_id FROM sessions WHERE token=$1', [token]);
+    if (sess.rowCount > 0) {
+      const pid = sess.rows[0].player_id;
+      const me = await pool.query(
+        `SELECT p.nickname, s.score,
+                (SELECT COUNT(*)::int + 1 FROM saves s2 JOIN players p2 ON p2.id=s2.player_id
+                  WHERE p2.nickname IS NOT NULL AND s2.score > s.score) AS rank
+           FROM players p LEFT JOIN saves s ON s.player_id = p.id
+          WHERE p.id = $1`, [pid]
+      );
+      if (me.rowCount > 0) {
+        out.me = { nickname: me.rows[0].nickname, score: me.rows[0].score || 0,
+                   rank: me.rows[0].nickname ? me.rows[0].rank : null };
+      }
+    }
+  }
+  return out;
+});
+
+// ---- Start the server ------------------------------------------------------
 const PORT = process.env.PORT || 3000;
 try {
   await initDb();
