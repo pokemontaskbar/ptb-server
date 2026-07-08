@@ -58,6 +58,12 @@ async function initDb() {
   await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS players_nickname_uq ON players (LOWER(nickname)) WHERE nickname IS NOT NULL`);
   await pool.query(`ALTER TABLE saves ADD COLUMN IF NOT EXISTS score INTEGER NOT NULL DEFAULT 0`);
   await pool.query(`CREATE INDEX IF NOT EXISTS saves_score_idx ON saves (score DESC)`);
+  // ---- Blockchain-prep migrations (idempotent) ----
+  await pool.query(`ALTER TABLE players ADD COLUMN IF NOT EXISTS wallet TEXT`);
+  await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS players_wallet_uq ON players (wallet) WHERE wallet IS NOT NULL`);
+  await pool.query(`ALTER TABLE players ADD COLUMN IF NOT EXISTS reg_ip TEXT`);
+  await pool.query(`ALTER TABLE players ADD COLUMN IF NOT EXISTS last_ip TEXT`);
+  await pool.query(`ALTER TABLE players ADD COLUMN IF NOT EXISTS last_login TIMESTAMPTZ`);
 }
 
 // ---- Password security: hash with salt (standard, never store plain password) -----
@@ -85,6 +91,23 @@ function speciesPoints(sp){
   const rarMul = 1 + (rarityOf(sp)-1)*0.5;
   return Math.max(1, Math.round((bst/20) * rarMul));
 }
+// ---- Solana wallet validation (real base58 decode -> must be 32 bytes) ------
+const B58 = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';
+function isSolanaAddress(str){
+  if (typeof str !== 'string' || str.length < 32 || str.length > 44) return false;
+  let n = 0n;
+  for (const ch of str){
+    const v = B58.indexOf(ch);
+    if (v < 0) return false;
+    n = n * 58n + BigInt(v);
+  }
+  // count bytes: leading '1' chars = leading zero bytes
+  let zeros = 0; for (const ch of str){ if (ch === '1') zeros++; else break; }
+  let bytes = 0; let t = n;
+  while (t > 0n){ bytes++; t >>= 8n; }
+  return (zeros + bytes) === 32;
+}
+
 function stagePoints(gs){ return gs * 10; }
 function actPoints(ai){ return (ai + 1) * 500; }
 
@@ -111,7 +134,7 @@ function computeScore(save){
 }
 
 // ---- Web server ------------------------------------------------------------
-const app = Fastify({ logger: true });
+const app = Fastify({ logger: true, trustProxy: true }); // trustProxy: real client IP behind Render's proxy
 await app.register(cors, { origin: true }); // lets the game (in the browser) talk to the server
 
 // Server health (to know if it's up)
@@ -128,8 +151,8 @@ app.post('/register', async (req, reply) => {
   const hash = hashPassword(password, salt);
   try {
     const r = await pool.query(
-      'INSERT INTO players (email, pass_hash, pass_salt) VALUES ($1,$2,$3) RETURNING id',
-      [String(email).toLowerCase().trim(), hash, salt]
+      'INSERT INTO players (email, pass_hash, pass_salt, reg_ip) VALUES ($1,$2,$3,$4) RETURNING id',
+      [String(email).toLowerCase().trim(), hash, salt, req.ip || null]
     );
     return { ok: true, playerId: r.rows[0].id };
   } catch (e) {
@@ -158,7 +181,45 @@ app.post('/login', async (req, reply) => {
 
   const token = newSessionToken();
   await pool.query('INSERT INTO sessions (token, player_id) VALUES ($1,$2)', [token, p.id]);
+  await pool.query('UPDATE players SET last_ip=$1, last_login=now() WHERE id=$2', [req.ip || null, p.id]);
   return { ok: true, token, playerId: p.id };
+});
+
+// ---- SET SOLANA WALLET --------------------------------------------------------
+// One wallet per account (UNIQUE) - the same wallet cannot sit on two accounts.
+// Prizes are paid manually by the admin to these wallets.
+app.post('/wallet', async (req, reply) => {
+  const playerId = await requirePlayer(req, reply);
+  if (!playerId) return;
+  const wallet = String(req.body?.wallet || '').trim();
+  if (!isSolanaAddress(wallet)) {
+    return reply.code(400).send({ error: 'Invalid Solana address' });
+  }
+  try {
+    await pool.query('UPDATE players SET wallet=$1 WHERE id=$2', [wallet, playerId]);
+    return { ok: true, wallet };
+  } catch (e) {
+    if (e.code === '23505') return reply.code(409).send({ error: 'This wallet is already linked to another account' });
+    throw e;
+  }
+});
+
+// ---- ADMIN: winners + wallets (for manual prize payment) ----------------------
+// Protected by ADMIN_KEY env var. If not set, the endpoint is disabled.
+// Returns top 20 with nickname, score, wallet and IPs (to review multi-account
+// clusters BEFORE paying).
+app.get('/admin/winners', async (req, reply) => {
+  const key = process.env.ADMIN_KEY;
+  if (!key) return reply.code(503).send({ error: 'ADMIN_KEY not configured' });
+  if (req.query?.key !== key) return reply.code(403).send({ error: 'Forbidden' });
+  const r = await pool.query(
+    `SELECT p.nickname, p.email, p.wallet, p.reg_ip, p.last_ip, p.created_at, s.score, s.updated_at AS last_save
+       FROM saves s JOIN players p ON p.id = s.player_id
+      WHERE p.nickname IS NOT NULL
+      ORDER BY s.score DESC, s.updated_at ASC
+      LIMIT 20`
+  );
+  return { ok: true, winners: r.rows.map((x,i)=>({ rank:i+1, ...x })) };
 });
 
 // ---- Middleware: figure out WHO is requesting (by the badge) ---------------
@@ -166,10 +227,25 @@ async function requirePlayer(req, reply) {
   const auth = req.headers['authorization'] || '';
   const token = auth.startsWith('Bearer ') ? auth.slice(7) : null;
   if (!token) { reply.code(401).send({ error: 'Not authenticated (please log in)' }); return null; }
-  const r = await pool.query('SELECT player_id FROM sessions WHERE token=$1', [token]);
+  // Sessions expire after 30 days (stale/stolen tokens do not live forever).
+  const r = await pool.query(
+    "SELECT player_id, (created_at < now() - interval '30 days') AS expired FROM sessions WHERE token=$1", [token]);
   if (r.rowCount === 0) { reply.code(401).send({ error: 'Invalid session (please log in)' }); return null; }
+  if (r.rows[0].expired) {
+    await pool.query('DELETE FROM sessions WHERE token=$1', [token]);
+    reply.code(401).send({ error: 'Session expired (please log in again)' }); return null;
+  }
   return r.rows[0].player_id;
 }
+
+// ---- LOGOUT -----------------------------------------------------------------
+// Invalidates the session server-side (the badge stops working everywhere).
+app.post('/logout', async (req, reply) => {
+  const auth = req.headers['authorization'] || '';
+  const token = auth.startsWith('Bearer ') ? auth.slice(7) : null;
+  if (token) await pool.query('DELETE FROM sessions WHERE token=$1', [token]);
+  return { ok: true };
+});
 
 // ---- SAVE THE SAVE ---------------------------------------------------------
 // The game sends the whole save (the same object that today goes to localStorage).
