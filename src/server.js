@@ -196,6 +196,14 @@ app.post('/wallet', async (req, reply) => {
   const wallet = String(req.body?.wallet || '').trim();
   if (!isSolanaAddress(wallet)) {
     return reply.code(400).send({ error: 'Invalid Solana address' });
+
+// ---- GET current wallet (so the UI can show what's linked) ------------------
+app.get('/wallet', async (req, reply) => {
+  const playerId = await requirePlayer(req, reply);
+  if (!playerId) return;
+  const r = await pool.query('SELECT wallet FROM players WHERE id=$1', [playerId]);
+  return { ok: true, wallet: r.rows[0]?.wallet || null };
+});
   }
   try {
     await pool.query('UPDATE players SET wallet=$1 WHERE id=$2', [wallet, playerId]);
