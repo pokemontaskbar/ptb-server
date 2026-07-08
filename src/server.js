@@ -78,6 +78,8 @@ function newSessionToken() {
   return crypto.randomBytes(32).toString('hex');
 }
 
+// Leaderboard cache (declared early: /save invalidates it before it's defined below)
+let _lbCache = null, _lbCacheTs = 0;
 // ---- SERVER-SIDE SCORE (mini-judge for the ranking) -------------------------
 // The client's `score` field is NEVER trusted. The server recomputes the score
 // from the finite, verifiable sets in the save (species/stages/acts), using the
@@ -260,6 +262,7 @@ app.post('/save', async (req, reply) => {
 
   // Server-side score: recomputed from the sets, never trusted from the client.
   const score = computeScore(save);
+  _lbCacheTs = 0; // a new score may change the ranking -> drop the leaderboard cache
 
   await pool.query(
     `INSERT INTO saves (player_id, save_json, version, score, updated_at)
@@ -307,7 +310,6 @@ app.post('/nickname', async (req, reply) => {
 // ---- LEADERBOARD ------------------------------------------------------------
 // Top 20 by server-computed score + the requester's own position (if logged in).
 // Only players who set a nickname appear. Cached 10s to protect the database.
-let _lbCache = null, _lbCacheTs = 0;
 app.get('/leaderboard', async (req, reply) => {
   const now = Date.now();
   if (!_lbCache || now - _lbCacheTs > 10_000) {
