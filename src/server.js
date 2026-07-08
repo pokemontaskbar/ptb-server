@@ -19,6 +19,7 @@ import Fastify from 'fastify';
 import cors from '@fastify/cors';
 import pg from 'pg';
 import crypto from 'node:crypto';
+import nacl from 'tweetnacl';
 
 const { Pool } = pg;
 
@@ -64,6 +65,15 @@ async function initDb() {
   await pool.query(`ALTER TABLE players ADD COLUMN IF NOT EXISTS reg_ip TEXT`);
   await pool.query(`ALTER TABLE players ADD COLUMN IF NOT EXISTS last_ip TEXT`);
   await pool.query(`ALTER TABLE players ADD COLUMN IF NOT EXISTS last_login TIMESTAMPTZ`);
+  // ---- Wallet proof-of-ownership migrations (Phase 1 - PLANO_WALLET_CONNECT.md) ----
+  await pool.query(`ALTER TABLE players ADD COLUMN IF NOT EXISTS wallet_verified BOOLEAN NOT NULL DEFAULT FALSE`);
+  await pool.query(`CREATE TABLE IF NOT EXISTS wallet_nonces (
+    nonce      TEXT PRIMARY KEY,
+    player_id  INTEGER NOT NULL REFERENCES players(id) ON DELETE CASCADE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    used       BOOLEAN NOT NULL DEFAULT FALSE
+  )`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_wallet_nonces_player ON wallet_nonces(player_id)`);
 }
 
 // ---- Password security: hash with salt (standard, never store plain password) -----
@@ -108,6 +118,48 @@ function isSolanaAddress(str){
   let bytes = 0; let t = n;
   while (t > 0n){ bytes++; t >>= 8n; }
   return (zeros + bytes) === 32;
+}
+
+// Decode a base58 Solana address to its raw 32 bytes (for ed25519 verification).
+// Returns a Uint8Array(32) or null if invalid. Mirrors isSolanaAddress's alphabet.
+function base58Decode(str){
+  if (typeof str !== 'string' || !str.length) return null;
+  let n = 0n;
+  for (const ch of str){
+    const v = B58.indexOf(ch);
+    if (v < 0) return null;
+    n = n * 58n + BigInt(v);
+  }
+  // big-endian bytes from the bigint
+  const bytes = [];
+  while (n > 0n){ bytes.unshift(Number(n & 0xffn)); n >>= 8n; }
+  // restore leading zero bytes (each leading '1' = one 0x00)
+  let zeros = 0; for (const ch of str){ if (ch === '1') zeros++; else break; }
+  while (zeros-- > 0) bytes.unshift(0);
+  if (bytes.length !== 32) return null;
+  return Uint8Array.from(bytes);
+}
+
+// Canonical wallet-link message. The SERVER builds this; the client mirrors the
+// EXACT same format. Phantom shows this text to the user before they sign.
+// Human-readable + anti-phishing line ("does NOT move funds").
+function walletLinkMessage(playerId, nonce){
+  return (
+    'Pokemon Task Bar - Link wallet\n' +
+    'I am linking this wallet to my PTB account.\n' +
+    'Account: #' + playerId + '\n' +
+    'Nonce: ' + nonce + '\n' +
+    'This request is free and does NOT move any funds.'
+  );
+}
+
+// ---- Simple in-memory rate limiter (server is single-instance) --------------
+const _rl = new Map(); // key -> [timestamps]
+function rateLimit(playerId, key, max, windowMs){
+  const k = key + ':' + playerId, now = Date.now();
+  const arr = (_rl.get(k) || []).filter(t => now - t < windowMs);
+  if (arr.length >= max) return false;
+  arr.push(now); _rl.set(k, arr); return true;
 }
 
 function stagePoints(gs){ return gs * 10; }
@@ -190,6 +242,8 @@ app.post('/login', async (req, reply) => {
 // ---- SET SOLANA WALLET --------------------------------------------------------
 // One wallet per account (UNIQUE) - the same wallet cannot sit on two accounts.
 // Prizes are paid manually by the admin to these wallets.
+// NOTE: this is the MANUAL paste path -> stored as UNVERIFIED (no proof of ownership).
+// The verified path is POST /wallet/verify (connect + signature).
 app.post('/wallet', async (req, reply) => {
   const playerId = await requirePlayer(req, reply);
   if (!playerId) return;
@@ -198,8 +252,8 @@ app.post('/wallet', async (req, reply) => {
     return reply.code(400).send({ error: 'Invalid Solana address' });
   }
   try {
-    await pool.query('UPDATE players SET wallet=$1 WHERE id=$2', [wallet, playerId]);
-    return { ok: true, wallet };
+    await pool.query('UPDATE players SET wallet=$1, wallet_verified=FALSE WHERE id=$2', [wallet, playerId]);
+    return { ok: true, wallet, verified: false };
   } catch (e) {
     if (e.code === '23505') return reply.code(409).send({ error: 'This wallet is already linked to another account' });
     throw e;
@@ -210,8 +264,94 @@ app.post('/wallet', async (req, reply) => {
 app.get('/wallet', async (req, reply) => {
   const playerId = await requirePlayer(req, reply);
   if (!playerId) return;
-  const r = await pool.query('SELECT wallet FROM players WHERE id=$1', [playerId]);
-  return { ok: true, wallet: r.rows[0]?.wallet || null };
+  const r = await pool.query('SELECT wallet, wallet_verified FROM players WHERE id=$1', [playerId]);
+  return { ok: true, wallet: r.rows[0]?.wallet || null, verified: r.rows[0]?.wallet_verified || false };
+});
+
+// ---- WALLET PROOF-OF-OWNERSHIP (Phase 1) -----------------------------------
+// Two-step connect+sign flow that proves the user CONTROLS the wallet, instead
+// of just pasting an address. Step 1 issues a one-time nonce; step 2 verifies
+// an ed25519 signature over a message the SERVER reconstructs (never trusts the
+// client's message text). See PLANO_WALLET_CONNECT.md section 2.
+
+// Step 1: issue a one-time nonce bound to this player.
+app.post('/wallet/nonce', async (req, reply) => {
+  const playerId = await requirePlayer(req, reply);
+  if (!playerId) return;
+  if (!rateLimit(playerId, 'wnonce', 5, 60_000)) {
+    return reply.code(429).send({ error: 'Too many attempts, wait a minute' });
+  }
+  // opportunistic cleanup of stale nonces (no cron needed)
+  await pool.query("DELETE FROM wallet_nonces WHERE created_at < now() - interval '1 hour'");
+  // one live nonce per player: invalidate any previous
+  await pool.query('DELETE FROM wallet_nonces WHERE player_id=$1', [playerId]);
+  const nonce = crypto.randomBytes(32).toString('hex');
+  await pool.query('INSERT INTO wallet_nonces(nonce, player_id) VALUES ($1,$2)', [nonce, playerId]);
+  // playerId returned so the client can build the exact canonical message
+  return { ok: true, nonce, playerId };
+});
+
+// Step 2: verify the signature and link the wallet as VERIFIED.
+app.post('/wallet/verify', async (req, reply) => {
+  const playerId = await requirePlayer(req, reply);
+  if (!playerId) return;
+  if (!rateLimit(playerId, 'wverify', 5, 60_000)) {
+    return reply.code(429).send({ error: 'Too many attempts, wait a minute' });
+  }
+
+  const wallet = String(req.body?.wallet || '').trim();
+  const sigB64 = String(req.body?.signature || '').trim();
+  const nonce  = String(req.body?.nonce || '').trim();
+
+  // 1. address format (base58 -> exactly 32 bytes)
+  if (!isSolanaAddress(wallet)) {
+    return reply.code(400).send({ error: 'Invalid Solana address' });
+  }
+  // 2. nonce format (64 hex) and signature format (base64 of 64 bytes)
+  if (!/^[0-9a-f]{64}$/.test(nonce)) {
+    return reply.code(400).send({ error: 'Invalid nonce' });
+  }
+  let sig;
+  try { sig = Buffer.from(sigB64, 'base64'); } catch (e) { sig = null; }
+  if (!sig || sig.length !== 64) {
+    return reply.code(400).send({ error: 'Invalid signature format' });
+  }
+
+  // 3. nonce must exist, belong to THIS player, be unused and unexpired.
+  //    Burned atomically in the same statement (single-use even under a race).
+  const nr = await pool.query(
+    `UPDATE wallet_nonces SET used=TRUE
+      WHERE nonce=$1 AND player_id=$2 AND used=FALSE
+        AND created_at > now() - interval '5 minutes'
+      RETURNING nonce`, [nonce, playerId]);
+  if (nr.rowCount !== 1) {
+    return reply.code(400).send({ error: 'Nonce expired or already used - try again' });
+  }
+
+  // 4. ed25519 verify. The message is RECONSTRUCTED here (never from the client).
+  const msg = Buffer.from(walletLinkMessage(playerId, nonce), 'utf8');
+  const pubkey = base58Decode(wallet);
+  if (!pubkey) {
+    return reply.code(400).send({ error: 'Invalid Solana address' });
+  }
+  const valid = nacl.sign.detached.verify(
+    new Uint8Array(msg), new Uint8Array(sig), pubkey);
+  if (!valid) {
+    return reply.code(401).send({ error: 'Signature verification failed' });
+  }
+
+  // 5. store as VERIFIED (UNIQUE index still guards against reuse across accounts)
+  try {
+    await pool.query(
+      'UPDATE players SET wallet=$1, wallet_verified=TRUE WHERE id=$2',
+      [wallet, playerId]);
+    return { ok: true, wallet, verified: true };
+  } catch (e) {
+    if (e.code === '23505') {
+      return reply.code(409).send({ error: 'This wallet is already linked to another account' });
+    }
+    throw e;
+  }
 });
 
 // ---- ADMIN: winners + wallets (for manual prize payment) ----------------------
@@ -223,7 +363,7 @@ app.get('/admin/winners', async (req, reply) => {
   if (!key) return reply.code(503).send({ error: 'ADMIN_KEY not configured' });
   if (req.query?.key !== key) return reply.code(403).send({ error: 'Forbidden' });
   const r = await pool.query(
-    `SELECT p.nickname, p.email, p.wallet, p.reg_ip, p.last_ip, p.created_at, s.score, s.updated_at AS last_save
+    `SELECT p.nickname, p.email, p.wallet, p.wallet_verified, p.reg_ip, p.last_ip, p.created_at, s.score, s.updated_at AS last_save
        FROM saves s JOIN players p ON p.id = s.player_id
       WHERE p.nickname IS NOT NULL
       ORDER BY s.score DESC, s.updated_at ASC
