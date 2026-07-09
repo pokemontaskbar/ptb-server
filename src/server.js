@@ -161,6 +161,15 @@ function rateLimit(playerId, key, max, windowMs){
   if (arr.length >= max) return false;
   arr.push(now); _rl.set(k, arr); return true;
 }
+// S0: periodic sweep so _rl doesn't grow forever (entries whose window fully
+// expired are dropped). Cheap: runs every 10 min, single pass.
+setInterval(() => {
+  const now = Date.now();
+  for (const [k, arr] of _rl) {
+    const alive = arr.filter(t => now - t < 10 * 60_000);
+    if (alive.length === 0) _rl.delete(k); else _rl.set(k, alive);
+  }
+}, 10 * 60_000).unref?.();
 
 function stagePoints(gs){ return gs * 10; }
 function actPoints(ai){ return (ai + 1) * 500; }
@@ -188,8 +197,26 @@ function computeScore(save){
 }
 
 // ---- Web server ------------------------------------------------------------
-const app = Fastify({ logger: true, trustProxy: true }); // trustProxy: real client IP behind Render's proxy
-await app.register(cors, { origin: true }); // lets the game (in the browser) talk to the server
+// S0.1: bodyLimit 256KB. Measured real save sizes (2026-07-09): fresh game ~2KB,
+// absolute-endgame save (151 species, 120 stages, full stash, all runes) ~14KB.
+// 256KB = ~18x headroom over the worst legitimate case, while cutting the
+// 1MB default that would accept abusive payloads.
+const app = Fastify({ logger: true, trustProxy: true, bodyLimit: 256 * 1024 });
+// S0.3: CORS restricted to the game's origin(s). Comma-separated env var so
+// G can add a custom domain / localhost for dev WITHOUT redeploying code.
+// Fallback = production origin. `origin:true` (any site) was hole F4.
+// HONESTY NOTE: CORS only stops *browsers on other sites* from reading our
+// responses with the victim's cookies/session. It does NOT stop direct scripts
+// (curl etc.) — that's what auth + rate limits are for. Don't oversell it.
+const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || 'https://ptb-game.pages.dev')
+  .split(',').map(s => s.trim()).filter(Boolean);
+await app.register(cors, {
+  origin: (origin, cb) => {
+    // No Origin header = same-origin, curl, health checks, mobile webviews -> allow.
+    if (!origin) return cb(null, true);
+    cb(null, ALLOWED_ORIGINS.includes(origin));
+  }
+});
 
 // Server health (to know if it's up)
 app.get('/health', async () => ({ ok: true, ts: Date.now() }));
@@ -402,11 +429,39 @@ app.post('/logout', async (req, reply) => {
 // NOTE: at this step the server TRUSTS the save (just stores it). The "judge" that
 // validates the numbers comes in step 3 - not yet cheat-proof, and
 // that's fine: this step only proves the foundation (move the save out of the browser).
+// S0.4: structural sanity check on the save. Philosophy: "flag, don't ban" —
+// we only REJECT what is impossible for a legitimate client (forged/abusive),
+// and never destroy the player's local save (client keeps playing on 4xx).
+// Bounds are structural (array sizes), not gameplay judgments.
+function saveShapeError(save){
+  if (!save || typeof save !== 'object' || Array.isArray(save)) return 'not an object';
+  // score sets: legitimate maxima are 151 species / 120 stages / 12 acts.
+  // We allow slack (bugs may duplicate entries) but cut off the absurd.
+  const cap = (arr, max, name) =>
+    (arr !== undefined && (!Array.isArray(arr) || arr.length > max)) ? (name + ' invalid or > ' + max) : null;
+  return cap(save.scoredSpecies, 1000, 'scoredSpecies')
+      || cap(save.scoredStages,  1000, 'scoredStages')
+      || cap(save.scoredActs,     100, 'scoredActs')
+      || null;
+}
+
 app.post('/save', async (req, reply) => {
   const playerId = await requirePlayer(req, reply);
   if (!playerId) return;
+  // S0.2: rate limit. Client autosaves every ~30s + on visibilitychange (tab
+  // switches), so honest bursts happen; 30/min is far above any honest pattern
+  // (~2-6/min) while stopping save-flood abuse.
+  if (!rateLimit(playerId, 'save', 30, 60_000)) {
+    return reply.code(429).send({ error: 'Too many saves, slow down' });
+  }
   const save = req.body;
   if (!save || typeof save !== 'object') return reply.code(400).send({ error: 'Invalid save data' });
+  // S0.4: reject structurally-forged saves (impossible for a real client).
+  const shapeErr = saveShapeError(save);
+  if (shapeErr) {
+    req.log.warn({ playerId, shapeErr }, 'save rejected: bad shape');
+    return reply.code(400).send({ error: 'Invalid save data' });
+  }
 
   // Server-side score: recomputed from the sets, never trusted from the client.
   const score = computeScore(save);
