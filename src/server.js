@@ -59,6 +59,23 @@ async function initDb() {
   await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS players_nickname_uq ON players (LOWER(nickname)) WHERE nickname IS NOT NULL`);
   await pool.query(`ALTER TABLE saves ADD COLUMN IF NOT EXISTS score INTEGER NOT NULL DEFAULT 0`);
   await pool.query(`CREATE INDEX IF NOT EXISTS saves_score_idx ON saves (score DESC)`);
+  // ---- S1 (anti-cheat) migration: suspicion flags counter (flag, don't ban) ----
+  await pool.query(`ALTER TABLE saves ADD COLUMN IF NOT EXISTS flags INTEGER NOT NULL DEFAULT 0`);
+  // ---- S2 (telemetry) migration: score history, ONE row per score CHANGE ------
+  // Volume budget (free-tier aware, plan §6): score only changes when the player
+  // earns a new milestone (~300 events per player LIFETIME). 500 players ≈ 150k
+  // rows over months — fine for the free tier. client_score = what the client
+  // *claimed*; big divergence from our recomputed score = console-edit signal.
+  await pool.query(`CREATE TABLE IF NOT EXISTS score_events (
+    id           BIGSERIAL PRIMARY KEY,
+    player_id    BIGINT NOT NULL REFERENCES players(id) ON DELETE CASCADE,
+    ts           TIMESTAMPTZ NOT NULL DEFAULT now(),
+    old_score    INTEGER NOT NULL,
+    new_score    INTEGER NOT NULL,
+    client_score INTEGER,
+    gap          BOOLEAN NOT NULL DEFAULT FALSE
+  )`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS score_events_player_idx ON score_events(player_id, ts)`);
   // ---- Blockchain-prep migrations (idempotent) ----
   await pool.query(`ALTER TABLE players ADD COLUMN IF NOT EXISTS wallet TEXT`);
   await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS players_wallet_uq ON players (wallet) WHERE wallet IS NOT NULL`);
@@ -170,30 +187,50 @@ setInterval(() => {
     if (alive.length === 0) _rl.delete(k); else _rl.set(k, alive);
   }
 }, 10 * 60_000).unref?.();
+// S4.1 (audit, 500+ players): expired sessions (>30d) currently only die when
+// someone tries to USE them — abandoned tokens linger forever. Daily sweep.
+setInterval(() => {
+  pool.query("DELETE FROM sessions WHERE created_at < now() - interval '30 days'")
+    .catch(() => {}); // sweep failure is harmless; next day retries
+}, 24 * 60 * 60_000).unref?.();
 
 function stagePoints(gs){ return gs * 10; }
 function actPoints(ai){ return (ai + 1) * 500; }
 
 // Validates the sets and recomputes the score. Garbage in -> ignored.
+// S1.2 (order rule): game progression is strictly linear — VERIFIED in the client
+// (tier only advances after clearing act2/stage9; stage picker blocks unplayed
+// stages with "Clear the previous stage first"). So a legitimate scoredStages is
+// ALWAYS the contiguous prefix 1..N, and scoredActs the prefix 0..M. Anything
+// after a gap is unearnable -> it simply doesn't count (and we flag the save).
+// This kills the classic forge `scoredStages:[120]` (counts 0). Species have no
+// known order map yet (S3.2) -> left as-is on purpose, per the plan.
 function computeScore(save){
-  if(!save || typeof save !== 'object') return 0;
+  if(!save || typeof save !== 'object') return { score: 0, gap: false };
   let total = 0;
+  let gap = false;
   const species = Array.isArray(save.scoredSpecies) ? save.scoredSpecies : [];
   const stages  = Array.isArray(save.scoredStages)  ? save.scoredStages  : [];
   const acts    = Array.isArray(save.scoredActs)    ? save.scoredActs    : [];
-  // species: unique ints 1..151
+  // species: unique ints 1..151 (no order map exists yet — see plan S3.2)
   const sp = new Set();
   for(const v of species){ if(Number.isInteger(v) && v>=1 && v<=151) sp.add(v); }
   for(const v of sp) total += speciesPoints(v);
-  // stages: unique ints 1..120 (game documents st1..st120)
+  // stages: unique ints 1..120, but ONLY the contiguous prefix starting at 1 counts
   const st = new Set();
   for(const v of stages){ if(Number.isInteger(v) && v>=1 && v<=120) st.add(v); }
-  for(const v of st) total += stagePoints(v);
-  // acts: unique ints 0..11 (12 global acts, 500..6000)
+  for(let gs=1; gs<=120; gs++){
+    if(!st.has(gs)){ if(st.size > gs-1) gap = true; break; } // items beyond the gap exist -> flag
+    total += stagePoints(gs);
+  }
+  // acts: unique ints 0..11, same contiguous-prefix rule starting at 0
   const ac = new Set();
   for(const v of acts){ if(Number.isInteger(v) && v>=0 && v<=11) ac.add(v); }
-  for(const v of ac) total += actPoints(v);
-  return total;
+  for(let ai=0; ai<=11; ai++){
+    if(!ac.has(ai)){ if(ac.size > ai) gap = true; break; }
+    total += actPoints(ai);
+  }
+  return { score: total, gap };
 }
 
 // ---- Web server ------------------------------------------------------------
@@ -224,6 +261,14 @@ app.get('/health', async () => ({ ok: true, ts: Date.now() }));
 // ---- CREATE ACCOUNT --------------------------------------------------------
 // The game sends { email, password }. The server creates the player.
 app.post('/register', async (req, reply) => {
+  // S4.2: per-IP limit — mass account creation is the cheapest attack against a
+  // ranked game (bot accounts flooding the leaderboard). 10/hour per IP allows
+  // shared IPs (NAT: family, campus) while adding friction to naive scripts.
+  // AUDIT NOTE: forgeable via X-Forwarded-For (see /login note) -> friction, not
+  // a wall. Real wall against bot accounts = S2 telemetry + admin review.
+  if (!rateLimit(req.ip, 'register', 10, 60 * 60_000)) {
+    return reply.code(429).send({ error: 'Too many accounts created, try later' });
+  }
   const { email, password } = req.body || {};
   if (!email || !password) return reply.code(400).send({ error: 'Email and password are required' });
   if (String(password).length < 6) return reply.code(400).send({ error: 'Password too short (min 6)' });
@@ -246,7 +291,21 @@ app.post('/register', async (req, reply) => {
 // ---- LOGIN -----------------------------------------------------------------
 // The game sends { email, password }. If it matches, returns a "badge" (token).
 app.post('/login', async (req, reply) => {
+  // S4.2: two independent limits.
+  // (a) per-IP: generous human ceiling. AUDIT NOTE: with trustProxy:true the
+  //     client can forge X-Forwarded-For and rotate req.ip, so the IP limit is
+  //     honest-friction only, not a hard wall. Changing trustProxy blindly risks
+  //     collapsing all players into one IP (mass 429) if Render has >1 hop, so
+  //     we keep it and add (b), which the attacker CANNOT forge:
+  // (b) per-target-email: brute-force is against a specific account; 10 tries /
+  //     15 min per email stops dictionaries cold regardless of source IP.
+  if (!rateLimit(req.ip, 'login', 30, 15 * 60_000)) {
+    return reply.code(429).send({ error: 'Too many login attempts, try later' });
+  }
   const { email, password } = req.body || {};
+  if (email && !rateLimit(String(email).toLowerCase().trim(), 'loginTarget', 10, 15 * 60_000)) {
+    return reply.code(429).send({ error: 'Too many login attempts for this account, try later' });
+  }
   if (!email || !password) return reply.code(400).send({ error: 'Email and password are required' });
 
   const r = await pool.query('SELECT id, pass_hash, pass_salt FROM players WHERE email=$1',
@@ -262,6 +321,17 @@ app.post('/login', async (req, reply) => {
 
   const token = newSessionToken();
   await pool.query('INSERT INTO sessions (token, player_id) VALUES ($1,$2)', [token, p.id]);
+  // S4.1 (session rotation, multi-device-safe): keep only the 5 most recent
+  // sessions per player. Old tokens die on re-login instead of lingering for
+  // 30 days; phone + PC (2-3 devices) never get logged out by a new login.
+  // Also stops the sessions table from growing forever (500+ player audit).
+  try {
+    await pool.query(
+      `DELETE FROM sessions WHERE player_id=$1 AND token NOT IN (
+         SELECT token FROM sessions WHERE player_id=$1 ORDER BY created_at DESC LIMIT 5)`,
+      [p.id]
+    );
+  } catch (e) { req.log.warn({ err: e.message }, 'S4.1: session rotation failed (login still ok)'); }
   await pool.query('UPDATE players SET last_ip=$1, last_login=now() WHERE id=$2', [req.ip || null, p.id]);
   return { ok: true, token, playerId: p.id };
 });
@@ -399,6 +469,33 @@ app.get('/admin/winners', async (req, reply) => {
   return { ok: true, winners: r.rows.map((x,i)=>({ rank:i+1, ...x })) };
 });
 
+// ---- S2.3: SUSPECT REVIEW (admin) -------------------------------------------
+// Accounts with suspicion flags (S1 regressions/gaps) and recent client-vs-server
+// score divergences (classic console-edit signal), for G's MANUAL review.
+// Flags never auto-ban (plan philosophy); this endpoint is the human-review path.
+app.get('/admin/suspects', async (req, reply) => {
+  const key = process.env.ADMIN_KEY;
+  if (!key) return reply.code(503).send({ error: 'ADMIN_KEY not configured' });
+  if (req.query?.key !== key) return reply.code(403).send({ error: 'Forbidden' });
+  const flagged = await pool.query(
+    `SELECT p.id, p.nickname, p.email, p.reg_ip, p.last_ip, p.created_at,
+            s.score, s.flags, s.updated_at AS last_save
+       FROM saves s JOIN players p ON p.id = s.player_id
+      WHERE s.flags > 0
+      ORDER BY s.flags DESC, s.updated_at DESC
+      LIMIT 50`
+  );
+  const diverging = await pool.query(
+    `SELECT e.player_id, p.nickname, e.ts, e.new_score, e.client_score
+       FROM score_events e JOIN players p ON p.id = e.player_id
+      WHERE e.client_score IS NOT NULL
+        AND (e.client_score - e.new_score > 1000 OR e.new_score - e.client_score > 1000)
+      ORDER BY e.ts DESC
+      LIMIT 50`
+  );
+  return { ok: true, flagged: flagged.rows, diverging: diverging.rows };
+});
+
 // ---- Middleware: figure out WHO is requesting (by the badge) ---------------
 async function requirePlayer(req, reply) {
   const auth = req.headers['authorization'] || '';
@@ -464,14 +561,49 @@ app.post('/save', async (req, reply) => {
   }
 
   // Server-side score: recomputed from the sets, never trusted from the client.
-  const score = computeScore(save);
-  _lbCacheTs = 0; // a new score may change the ranking -> drop the leaderboard cache
+  // S1.2: only the contiguous progression prefix counts (gap => forged tail ignored).
+  const { score: newScore, gap } = computeScore(save);
+
+  // S1.1 (monotonicity): progress only moves forward. Fetch the currently stored
+  // score; if the new one is LOWER, the save is still accepted (could be a local
+  // restore) but the ranking score never goes down, and we count a flag.
+  const prev = await pool.query('SELECT score, flags FROM saves WHERE player_id=$1', [playerId]);
+  const oldScore = prev.rowCount ? (prev.rows[0].score || 0) : 0;
+  let flags = prev.rowCount ? (prev.rows[0].flags || 0) : 0;
+  if (gap) { flags++; req.log.warn({ playerId, newScore }, 'S1.2: progression gap in save (forged tail ignored)'); }
+  if (newScore < oldScore) { flags++; req.log.warn({ playerId, oldScore, newScore }, 'S1.1: score regression (ranking kept at high-water mark)'); }
+  let effScore = Math.max(newScore, oldScore); // high-water mark
+  // FASE T (lock 2/2): dev-test saves (_cheated) never rank. Deliberately
+  // bypasses the high-water mark: once a save is marked as test, its account
+  // holds score 0 and leaves the leaderboard (which filters score > 0).
+  if (save._cheated === true) effScore = 0;
+
+  // Scale fix (audited for 500+ players): only drop the leaderboard cache when
+  // the effective score actually CHANGED. Before, EVERY autosave nuked the cache,
+  // turning the 10s cache useless under load (~17 saves/min at 500 players).
+  if (effScore !== oldScore) {
+    _lbCacheTs = 0;
+    // S2.2 (telemetry): one history row per score CHANGE. Captures, never judges
+    // — thresholds come later (S3) from THIS data, not from guesses.
+    // client_score = what the client itself claims; divergence from our
+    // recomputed number is the classic `G.score=999999` console-edit signal.
+    const clientScore = Number.isInteger(save.score) ? save.score : null;
+    try {
+      await pool.query(
+        `INSERT INTO score_events (player_id, old_score, new_score, client_score, gap)
+         VALUES ($1,$2,$3,$4,$5)`,
+        [playerId, oldScore, effScore, clientScore, gap]
+      );
+    } catch (e) {
+      req.log.warn({ err: e.message }, 'S2: score_event insert failed (save still accepted)');
+    }
+  }
 
   await pool.query(
-    `INSERT INTO saves (player_id, save_json, version, score, updated_at)
-     VALUES ($1,$2,$3,$4, now())
-     ON CONFLICT (player_id) DO UPDATE SET save_json=$2, version=$3, score=$4, updated_at=now()`,
-    [playerId, save, save.v || null, score]
+    `INSERT INTO saves (player_id, save_json, version, score, flags, updated_at)
+     VALUES ($1,$2,$3,$4,$5, now())
+     ON CONFLICT (player_id) DO UPDATE SET save_json=$2, version=$3, score=$4, flags=$5, updated_at=now()`,
+    [playerId, save, save.v || null, effScore, flags]
   );
   return { ok: true, savedAt: Date.now() };
 });
@@ -519,12 +651,12 @@ app.get('/leaderboard', async (req, reply) => {
     const top = await pool.query(
       `SELECT p.nickname, s.score
          FROM saves s JOIN players p ON p.id = s.player_id
-        WHERE p.nickname IS NOT NULL
+        WHERE p.nickname IS NOT NULL AND s.score > 0
         ORDER BY s.score DESC, s.updated_at ASC
         LIMIT 20`
     );
     const tot = await pool.query(
-      `SELECT COUNT(*)::int AS n FROM saves s JOIN players p ON p.id = s.player_id WHERE p.nickname IS NOT NULL`
+      `SELECT COUNT(*)::int AS n FROM saves s JOIN players p ON p.id = s.player_id WHERE p.nickname IS NOT NULL AND s.score > 0`
     );
     _lbCache = { top: top.rows.map((r, i) => ({ rank: i + 1, nickname: r.nickname, score: r.score })), total: tot.rows[0].n };
     _lbCacheTs = now;
@@ -532,6 +664,9 @@ app.get('/leaderboard', async (req, reply) => {
   const out = { ok: true, top: _lbCache.top, total: _lbCache.total };
 
   // "me": optional - resolved per request (not cached), via Bearer token
+  // Wrapped in try/catch: a failure computing "me" must NEVER take down the
+  // whole leaderboard (top20 still answers; "me" is just omitted).
+  try {
   const auth = req.headers.authorization || '';
   const token = auth.startsWith('Bearer ') ? auth.slice(7) : null;
   if (token) {
@@ -546,10 +681,16 @@ app.get('/leaderboard', async (req, reply) => {
           WHERE p.id = $1`, [pid]
       );
       if (me.rowCount > 0) {
-        out.me = { nickname: me.rows[0].nickname, score: me.rows[0].score || 0,
-                   rank: me.rows[0].nickname ? me.rows[0].rank : null };
+        // score 0 = out of the ranking (new players and _cheated test saves):
+        // rank must be null, consistent with the top/total filters (score > 0).
+        const meScore = me.rows[0].score || 0;
+        out.me = { nickname: me.rows[0].nickname, score: meScore,
+                   rank: (me.rows[0].nickname && meScore > 0) ? me.rows[0].rank : null };
       }
     }
+  }
+  } catch (e) {
+    req.log.warn({ err: e.message }, 'leaderboard: "me" lookup failed (top20 still served)');
   }
   return out;
 });
