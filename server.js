@@ -20,6 +20,7 @@ import cors from '@fastify/cors';
 import pg from 'pg';
 import crypto from 'node:crypto';
 import nacl from 'tweetnacl';
+import { verifyMessage as evmVerifyMessage, getAddress as evmGetAddress } from 'ethers';
 
 const { Pool } = pg;
 
@@ -91,6 +92,15 @@ async function initDb() {
     used       BOOLEAN NOT NULL DEFAULT FALSE
   )`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_wallet_nonces_player ON wallet_nonces(player_id)`);
+  // ---- Multi-game migration: which game a save belongs to ('ptb' default keeps
+  //      every existing PTB save correct; RobinHood Idle writes 'rh'). ----------
+  await pool.query(`ALTER TABLE saves ADD COLUMN IF NOT EXISTS game TEXT NOT NULL DEFAULT 'ptb'`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS saves_game_score_idx ON saves (game, score DESC)`);
+  // ---- EVM wallet (Robinhood Chain) kept SEPARATE from the Solana `wallet`
+  //      column so a player can link both without collision. ------------------
+  await pool.query(`ALTER TABLE players ADD COLUMN IF NOT EXISTS wallet_evm TEXT`);
+  await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS players_wallet_evm_uq ON players (LOWER(wallet_evm)) WHERE wallet_evm IS NOT NULL`);
+  await pool.query(`ALTER TABLE players ADD COLUMN IF NOT EXISTS wallet_evm_verified BOOLEAN NOT NULL DEFAULT FALSE`);
 }
 
 // ---- Password security: hash with salt (standard, never store plain password) -----
@@ -106,7 +116,7 @@ function newSessionToken() {
 }
 
 // Leaderboard cache (declared early: /save invalidates it before it's defined below)
-let _lbCache = null, _lbCacheTs = 0;
+let _lbCacheByGame = new Map(); // game -> { data, ts }
 // ---- SERVER-SIDE SCORE (mini-judge for the ranking) -------------------------
 // The client's `score` field is NEVER trusted. The server recomputes the score
 // from the finite, verifiable sets in the save (species/stages/acts), using the
@@ -170,6 +180,18 @@ function walletLinkMessage(playerId, nonce){
   );
 }
 
+// Canonical message for RobinHood Idle EVM wallet linking. Reconstructed on the
+// server (never trusted from the client) and signed by the user via personal_sign.
+function walletLinkMessageEVM(playerId, nonce){
+  return (
+    'RobinHood Idle - Link wallet\n' +
+    'I am linking this wallet to my RobinHood Idle account.\n' +
+    'Account: #' + playerId + '\n' +
+    'Nonce: ' + nonce + '\n' +
+    'This request is free and does NOT move any funds.'
+  );
+}
+
 // ---- Simple in-memory rate limiter (server is single-instance) --------------
 const _rl = new Map(); // key -> [timestamps]
 function rateLimit(playerId, key, max, windowMs){
@@ -205,67 +227,54 @@ function actPoints(ai){ return (ai + 1) * 500; }
 // after a gap is unearnable -> it simply doesn't count (and we flag the save).
 // This kills the classic forge `scoredStages:[120]` (counts 0). Species have no
 // known order map yet (S3.2) -> left as-is on purpose, per the plan.
-//
-// S3-LITE (physics gate, launch hardening): a stage takes a MINIMUM wall-clock
-// time — derived from game CODE constants, not guesses: initial spawn is 1-2
-// enemies, the rest trickle in 1 per 4-7s (scheduleTrickle), min wave = 5
-// enemies => >=12s/wave; min waves/stage = 2 (WaveCountReduction floor) =>
-// theoretical floor ~24s/stage. We enforce HALF of that (12s) as a player-
-// favorable margin. The budget is the ACCOUNT AGE (players.created_at — a
-// 100%% server-side, unforgeable clock) + a grace window (env) that covers
-// guest-progress import on account creation. No account can hold more stages
-// than its lifetime physically allows. Species get the same treatment with an
-// ultra-conservative 1s/species floor. Excess NEVER destroys the save — it
-// just doesn't count (capped) and raises a flag for admin review.
-const MIN_STAGE_MS   = parseInt(process.env.MIN_STAGE_MS   || '12000', 10); // 12s/stage
-const MIN_SPECIES_MS = parseInt(process.env.MIN_SPECIES_MS || '3000', 10);  // 3s/species (kill floor: trickle spawns 1 enemy per 4-7s)
-const GRACE_MS       = parseInt(process.env.GRACE_MS       || '120000', 10); // 2min headroom
-// NOTE on caps being self-healing: the budget is the ACCOUNT AGE, so a capped
-// legitimate save (e.g. guest importing progress on account creation) counts
-// MORE on every subsequent autosave as the account ages — full score appears
-// on its own within minutes. Nothing is ever destroyed.
-
-function computeScore(save, accountAgeMs){
-  if(!save || typeof save !== 'object') return { score: 0, gap: false, capped: false };
+function computeScore(save){
+  if(!save || typeof save !== 'object') return { score: 0, gap: false };
   let total = 0;
   let gap = false;
-  let capped = false;
-  // physics budget from account age (server clock). If age unknown, no cap
-  // (fail-open for score only; the caller always passes it for /save).
-  const budget = (typeof accountAgeMs === 'number') ? accountAgeMs + GRACE_MS : Infinity;
-  const maxStagesAllowed  = Math.min(120, Math.floor(budget / MIN_STAGE_MS));
-  const maxSpeciesAllowed = Math.min(151, Math.floor(budget / MIN_SPECIES_MS));
   const species = Array.isArray(save.scoredSpecies) ? save.scoredSpecies : [];
   const stages  = Array.isArray(save.scoredStages)  ? save.scoredStages  : [];
   const acts    = Array.isArray(save.scoredActs)    ? save.scoredActs    : [];
-  // species: unique ints 1..151, capped by physics budget
+  // species: unique ints 1..151 (no order map exists yet — see plan S3.2)
   const sp = new Set();
   for(const v of species){ if(Number.isInteger(v) && v>=1 && v<=151) sp.add(v); }
-  if(sp.size > maxSpeciesAllowed) capped = true;
-  let spCount = 0;
-  for(const v of sp){ if(spCount >= maxSpeciesAllowed) break; total += speciesPoints(v); spCount++; }
-  // stages: contiguous prefix from 1, capped by physics budget
+  for(const v of sp) total += speciesPoints(v);
+  // stages: unique ints 1..120, but ONLY the contiguous prefix starting at 1 counts
   const st = new Set();
   for(const v of stages){ if(Number.isInteger(v) && v>=1 && v<=120) st.add(v); }
-  let prefixLen = 0; // full contiguous prefix length (before physics cap)
-  for(let gs=1; gs<=120; gs++){ if(!st.has(gs)) break; prefixLen = gs; }
-  if(st.size > prefixLen) gap = true;
-  let stageN = 0; // highest contiguous stage that COUNTED (after cap)
-  for(let gs=1; gs<=prefixLen; gs++){
-    if(gs > maxStagesAllowed){ capped = true; break; }
+  for(let gs=1; gs<=120; gs++){
+    if(!st.has(gs)){ if(st.size > gs-1) gap = true; break; } // items beyond the gap exist -> flag
     total += stagePoints(gs);
-    stageN = gs;
   }
-  // acts: contiguous prefix from 0, and global act i is only clearable once
-  // stage (i+1)*10 was cleared -> tie acts to the stage prefix that counted.
+  // acts: unique ints 0..11, same contiguous-prefix rule starting at 0
   const ac = new Set();
   for(const v of acts){ if(Number.isInteger(v) && v>=0 && v<=11) ac.add(v); }
   for(let ai=0; ai<=11; ai++){
     if(!ac.has(ai)){ if(ac.size > ai) gap = true; break; }
-    if(stageN < (ai+1)*10){ capped = true; break; } // act i requires global stage (i+1)*10 cleared
     total += actPoints(ai);
   }
-  return { score: total, gap, capped, excessStages: Math.max(0, prefixLen - stageN) };
+  return { score: total, gap };
+}
+
+// ---- RobinHood Idle score: derived from bestStage, recomputed server-side.
+// Mirrors the client's rhComputeScore. Kept separate from PTB's computeScore so
+// neither game can corrupt the other's ranking. NOTE: like PTB's /save today,
+// this TRUSTS bestStage (no authoritative recompute yet) — that's the future
+// authoritative backend, deliberately out of scope for this online step.
+function computeScoreRH(save){
+  if(!save || typeof save !== 'object') return { score: 0, gap: false };
+  const bs = Number(save.bestStage);
+  if(!Number.isInteger(bs) || bs < 1) return { score: 0, gap: false };
+  // EXACT mirror of client rhComputeScore: sum of rhStagePoints(n)=10+floor(n*1.5)
+  let t = 0;
+  for(let n = 1; n <= bs; n++) t += 10 + Math.floor(n * 1.5);
+  return { score: t, gap: false };
+}
+function saveShapeErrorRH(save){
+  if (!save || typeof save !== 'object' || Array.isArray(save)) return 'not an object';
+  const bs = save.bestStage;
+  if (bs !== undefined && (!Number.isInteger(bs) || bs < 0 || bs > 100000)) return 'bestStage invalid';
+  if (Array.isArray(save.inv) && save.inv.length > 5000) return 'inv too large';
+  return null;
 }
 
 // ---- Web server ------------------------------------------------------------
@@ -486,6 +495,86 @@ app.post('/wallet/verify', async (req, reply) => {
   }
 });
 
+// ===== EVM WALLET (Robinhood Chain) — mirrors the Solana flow, secp256k1 ======
+// Step 1: issue a one-time nonce for THIS player to sign (EVM).
+app.post('/wallet/nonce-evm', async (req, reply) => {
+  const playerId = await requirePlayer(req, reply);
+  if (!playerId) return;
+  if (!rateLimit(playerId, 'wnonce_evm', 5, 60_000)) {
+    return reply.code(429).send({ error: 'Too many attempts, wait a minute' });
+  }
+  await pool.query("DELETE FROM wallet_nonces WHERE created_at < now() - interval '1 hour'");
+  await pool.query('DELETE FROM wallet_nonces WHERE player_id=$1', [playerId]);
+  const nonce = crypto.randomBytes(32).toString('hex');
+  await pool.query('INSERT INTO wallet_nonces(nonce, player_id) VALUES ($1,$2)', [nonce, playerId]);
+  return { ok: true, nonce, playerId };
+});
+
+// Step 2: verify the EVM signature (personal_sign / EIP-191) and link the wallet.
+app.post('/wallet/verify-evm', async (req, reply) => {
+  const playerId = await requirePlayer(req, reply);
+  if (!playerId) return;
+  if (!rateLimit(playerId, 'wverify_evm', 5, 60_000)) {
+    return reply.code(429).send({ error: 'Too many attempts, wait a minute' });
+  }
+
+  const walletRaw = String(req.body?.wallet || '').trim();
+  const signature = String(req.body?.signature || '').trim();
+  const nonce     = String(req.body?.nonce || '').trim();
+
+  // 1. EVM address format (0x + 40 hex)
+  if (!/^0x[0-9a-fA-F]{40}$/.test(walletRaw)) {
+    return reply.code(400).send({ error: 'Invalid EVM address' });
+  }
+  // 2. nonce format (64 hex) and signature format (0x + 130 hex = 65 bytes)
+  if (!/^[0-9a-f]{64}$/.test(nonce)) {
+    return reply.code(400).send({ error: 'Invalid nonce' });
+  }
+  if (!/^0x[0-9a-fA-F]{130}$/.test(signature)) {
+    return reply.code(400).send({ error: 'Invalid signature format' });
+  }
+
+  // 3. burn the nonce atomically (single-use, must belong to THIS player, <5min)
+  const nr = await pool.query(
+    `UPDATE wallet_nonces SET used=TRUE
+       WHERE nonce=$1 AND player_id=$2 AND used=FALSE
+         AND created_at > now() - interval '5 minutes'
+       RETURNING nonce`, [nonce, playerId]);
+  if (nr.rowCount !== 1) {
+    return reply.code(400).send({ error: 'Nonce expired or already used - try again' });
+  }
+
+  // 4. secp256k1 verify. Message RECONSTRUCTED here, never taken from the client.
+  const msg = walletLinkMessageEVM(playerId, nonce);
+  let recovered;
+  try {
+    recovered = evmVerifyMessage(msg, signature);   // returns the signer address
+  } catch (e) {
+    return reply.code(401).send({ error: 'Signature verification failed' });
+  }
+  // checksum-normalise both sides before comparing
+  let wantAddr;
+  try { wantAddr = evmGetAddress(walletRaw); } catch (e) {
+    return reply.code(400).send({ error: 'Invalid EVM address' });
+  }
+  if (evmGetAddress(recovered) !== wantAddr) {
+    return reply.code(401).send({ error: 'Signature does not match wallet' });
+  }
+
+  // 5. store (lowercase for the UNIQUE index; display uses checksum on the client)
+  try {
+    await pool.query(
+      'UPDATE players SET wallet_evm=$1, wallet_evm_verified=TRUE WHERE id=$2',
+      [wantAddr.toLowerCase(), playerId]);
+    return { ok: true, wallet: wantAddr, verified: true };
+  } catch (e) {
+    if (e.code === '23505') {
+      return reply.code(409).send({ error: 'This wallet is already linked to another account' });
+    }
+    throw e;
+  }
+});
+
 // ---- ADMIN: winners + wallets (for manual prize payment) ----------------------
 // Protected by ADMIN_KEY env var. If not set, the endpoint is disabled.
 // Returns top 20 with nickname, score, wallet and IPs (to review multi-account
@@ -588,21 +677,18 @@ app.post('/save', async (req, reply) => {
   }
   const save = req.body;
   if (!save || typeof save !== 'object') return reply.code(400).send({ error: 'Invalid save data' });
+  // Which game this save belongs to. Default 'ptb' keeps existing behaviour.
+  const game = (req.body && req.body.game === 'rh') ? 'rh' : 'ptb';
   // S0.4: reject structurally-forged saves (impossible for a real client).
-  const shapeErr = saveShapeError(save);
+  const shapeErr = game === 'rh' ? saveShapeErrorRH(save) : saveShapeError(save);
   if (shapeErr) {
-    req.log.warn({ playerId, shapeErr }, 'save rejected: bad shape');
+    req.log.warn({ playerId, game, shapeErr }, 'save rejected: bad shape');
     return reply.code(400).send({ error: 'Invalid save data' });
   }
 
-  // Server-side score: recomputed from the sets, never trusted from the client.
-  // S1.2: only the contiguous progression prefix counts (gap => forged tail ignored).
-  // S3-LITE: capped by the account-age physics budget (see computeScore).
-  const ageRow = await pool.query('SELECT created_at FROM players WHERE id=$1', [playerId]);
-  const accountAgeMs = ageRow.rowCount
-    ? Math.max(0, Date.now() - new Date(ageRow.rows[0].created_at).getTime())
-    : 0;
-  const { score: newScore, gap, capped, excessStages } = computeScore(save, accountAgeMs);
+  // Server-side score: recomputed, never trusted from the client.
+  // S1.2 (PTB): only the contiguous progression prefix counts.
+  const { score: newScore, gap } = game === 'rh' ? computeScoreRH(save) : computeScore(save);
 
   // S1.1 (monotonicity): progress only moves forward. Fetch the currently stored
   // score; if the new one is LOWER, the save is still accepted (could be a local
@@ -611,10 +697,6 @@ app.post('/save', async (req, reply) => {
   const oldScore = prev.rowCount ? (prev.rows[0].score || 0) : 0;
   let flags = prev.rowCount ? (prev.rows[0].flags || 0) : 0;
   if (gap) { flags++; req.log.warn({ playerId, newScore }, 'S1.2: progression gap in save (forged tail ignored)'); }
-  // S3-lite flag: only when the excess is clearly forgery (>20 stages beyond the
-  // physics budget). Small excess = honest guest import catching up (self-heals
-  // as the account ages) — logging it every autosave would just flood the admin.
-  if (capped && excessStages > 20) { flags++; req.log.warn({ playerId, excessStages, accountAgeMs }, 'S3-lite: progress far beyond physics budget (excess not counted)'); }
   if (newScore < oldScore) { flags++; req.log.warn({ playerId, oldScore, newScore }, 'S1.1: score regression (ranking kept at high-water mark)'); }
   let effScore = Math.max(newScore, oldScore); // high-water mark
   // FASE T (lock 2/2): dev-test saves (_cheated) never rank. Deliberately
@@ -626,7 +708,7 @@ app.post('/save', async (req, reply) => {
   // the effective score actually CHANGED. Before, EVERY autosave nuked the cache,
   // turning the 10s cache useless under load (~17 saves/min at 500 players).
   if (effScore !== oldScore) {
-    _lbCacheTs = 0;
+    _lbCacheByGame.delete(game);
     // S2.2 (telemetry): one history row per score CHANGE. Captures, never judges
     // — thresholds come later (S3) from THIS data, not from guesses.
     // client_score = what the client itself claims; divergence from our
@@ -644,10 +726,10 @@ app.post('/save', async (req, reply) => {
   }
 
   await pool.query(
-    `INSERT INTO saves (player_id, save_json, version, score, flags, updated_at)
-     VALUES ($1,$2,$3,$4,$5, now())
-     ON CONFLICT (player_id) DO UPDATE SET save_json=$2, version=$3, score=$4, flags=$5, updated_at=now()`,
-    [playerId, save, save.v || null, effScore, flags]
+    `INSERT INTO saves (player_id, save_json, version, score, flags, game, updated_at)
+     VALUES ($1,$2,$3,$4,$5,$6, now())
+     ON CONFLICT (player_id) DO UPDATE SET save_json=$2, version=$3, score=$4, flags=$5, game=$6, updated_at=now()`,
+    [playerId, save, save.v || null, effScore, flags, game]
   );
   return { ok: true, savedAt: Date.now() };
 });
@@ -691,21 +773,32 @@ app.post('/nickname', async (req, reply) => {
 // Only players who set a nickname appear. Cached 10s to protect the database.
 app.get('/leaderboard', async (req, reply) => {
   const now = Date.now();
-  if (!_lbCache || now - _lbCacheTs > 10_000) {
+  // Per-game ranking. Default 'ptb' preserves the existing PTB behaviour.
+  const game = (req.query && req.query.game === 'rh') ? 'rh' : 'ptb';
+  const cached = _lbCacheByGame.get(game);
+  if (!cached || now - cached.ts > 10_000) {
     const top = await pool.query(
-      `SELECT p.nickname, s.score
+      `SELECT p.nickname, p.wallet_evm, s.score
          FROM saves s JOIN players p ON p.id = s.player_id
-        WHERE p.nickname IS NOT NULL AND s.score > 0
+        WHERE s.game = $1 AND s.score > 0
+          AND (p.nickname IS NOT NULL OR p.wallet_evm IS NOT NULL)
         ORDER BY s.score DESC, s.updated_at ASC
-        LIMIT 20`
+        LIMIT 20`, [game]
     );
     const tot = await pool.query(
-      `SELECT COUNT(*)::int AS n FROM saves s JOIN players p ON p.id = s.player_id WHERE p.nickname IS NOT NULL AND s.score > 0`
+      `SELECT COUNT(*)::int AS n FROM saves s JOIN players p ON p.id = s.player_id
+        WHERE s.game = $1 AND s.score > 0
+          AND (p.nickname IS NOT NULL OR p.wallet_evm IS NOT NULL)`, [game]
     );
-    _lbCache = { top: top.rows.map((r, i) => ({ rank: i + 1, nickname: r.nickname, score: r.score })), total: tot.rows[0].n };
-    _lbCacheTs = now;
+    const data = {
+      top: top.rows.map((r, i) => ({ rank: i + 1, nickname: r.nickname,
+        wallet: r.wallet_evm || null, score: r.score })),
+      total: tot.rows[0].n
+    };
+    _lbCacheByGame.set(game, { data, ts: now });
   }
-  const out = { ok: true, top: _lbCache.top, total: _lbCache.total };
+  const c = _lbCacheByGame.get(game).data;
+  const out = { ok: true, game, top: c.top, total: c.total };
 
   // "me": optional - resolved per request (not cached), via Bearer token
   // Wrapped in try/catch: a failure computing "me" must NEVER take down the
@@ -718,18 +811,20 @@ app.get('/leaderboard', async (req, reply) => {
     if (sess.rowCount > 0) {
       const pid = sess.rows[0].player_id;
       const me = await pool.query(
-        `SELECT p.nickname, s.score,
+        `SELECT p.nickname, p.wallet_evm, s.score,
                 (SELECT COUNT(*)::int + 1 FROM saves s2 JOIN players p2 ON p2.id=s2.player_id
-                  WHERE p2.nickname IS NOT NULL AND s2.score > s.score) AS rank
-           FROM players p LEFT JOIN saves s ON s.player_id = p.id
-          WHERE p.id = $1`, [pid]
+                  WHERE s2.game = $2 AND (p2.nickname IS NOT NULL OR p2.wallet_evm IS NOT NULL)
+                    AND s2.score > s.score) AS rank
+           FROM players p LEFT JOIN saves s ON s.player_id = p.id AND s.game = $2
+          WHERE p.id = $1`, [pid, game]
       );
       if (me.rowCount > 0) {
         // score 0 = out of the ranking (new players and _cheated test saves):
         // rank must be null, consistent with the top/total filters (score > 0).
         const meScore = me.rows[0].score || 0;
-        out.me = { nickname: me.rows[0].nickname, score: meScore,
-                   rank: (me.rows[0].nickname && meScore > 0) ? me.rows[0].rank : null };
+        const hasId = me.rows[0].nickname || me.rows[0].wallet_evm;
+        out.me = { nickname: me.rows[0].nickname, wallet: me.rows[0].wallet_evm || null, score: meScore,
+                   rank: (hasId && meScore > 0) ? me.rows[0].rank : null };
       }
     }
   }
